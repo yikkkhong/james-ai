@@ -1,0 +1,6 @@
+{
+  "verify": [
+    ["{python}", "-m", "compileall", "-q", "james"],
+    ["{python}", "-m", "unittest", "discover", "-s", "tests", "-v"]
+  ]
+}
