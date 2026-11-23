@@ -6,9 +6,12 @@ from datetime import datetime, timezone
 
 from . import actions
 from .memory import GlobalMemory, classify
-from .context import SHARED, clip, memory_context, messages, prompt, size, task_messages
+from .context import FRAMING, SHARED, clip, memory_context, messages, prompt, size, task_messages
 from .workspace import (CONFIG, INDEX, LESSONS, STATE, TODO, Workspace, digest,
                         packed, parse_title, render_tasks, rows, safe_name)
+
+
+STEP_LIMIT = 8
 
 
 def event(kind, **data):
@@ -39,10 +42,11 @@ def bounded_observation(active, message):
 
 
 class James:
-    def __init__(self, root, model):
+    def __init__(self, root, model, report=None):
         self.ws = Workspace(root)
         self.model = model
         self.global_memory = GlobalMemory()
+        self.report = report or (lambda message: None)
 
     def system_prompt(self, name):
         system = prompt(name)
@@ -78,8 +82,8 @@ class James:
     def save(self, state, changes=None, expected=None):
         self.ws.commit({**(changes or {}), STATE: packed(state)}, expected)
 
-    def plan(self, state, goal):
-        if state["phase"] not in {"idle", "complete", "review"} or not goal.strip():
+    def plan(self, state, goal, archive=None):
+        if (archive is None and state["phase"] not in {"idle", "complete", "review"}) or not goal.strip():
             raise ValueError("Supply a goal with no approved plan in progress.")
         before = digest(self.ws.path(TODO).read_bytes())
         context = "Goal\n" + goal + "\nWorkspace paths\n" + clip("\n".join(self.ws.inventory()), 4000)
@@ -93,7 +97,8 @@ class James:
                 if not isinstance(titles, list):
                     raise ValueError("Planner must return a tasks array.")
                 for title in titles:
-                    parse_title(title)
+                    if len(parse_title(title)) != 1:
+                        raise ValueError("Use exactly one target file per task. Split multi-file tasks into separate rows.")
                 todo = render_tasks([(False, title) for title in titles])
                 rows(todo)
                 break
@@ -101,8 +106,9 @@ class James:
                 if attempt == 1:
                     raise ValueError(f"Plan validation failed after 2 attempts (1 retry): {exc}") from exc
                 feedback = f"\nPrevious draft rejected: {exc}. Return a complete corrected plan."
-        state.update(phase="review", approved=[], completed=[])
-        self.save(state, {TODO: todo}, {TODO: before})
+        state.pop("active", None)
+        state.update(phase="review", approved=[], completed=[], goal=goal)
+        self.save(state, {**(archive or {}), TODO: todo}, {TODO: before})
         return event("review_required", todo=todo)
 
     def approve(self, state, _):
@@ -139,9 +145,13 @@ class James:
         flows = actions.workflows(self.ws)
         if active.get("inflight"):
             return event("paused", reason="Previous command was interrupted. Inspect its effects and use james hint to resume.")
+        active["read_requests"] = {}
+        active["patched_files"] = {}
         self.save(state)
         rejected = 0
-        for _turn in range(32):
+        for turn in range(1, STEP_LIMIT + 1):
+            self.report(f"Action {turn}/{STEP_LIMIT} · Reading index and waiting for model")
+            action = {}
             self.approved_rows(state)
             module_path = next((p for p in scope if p.casefold().startswith("memory/")), None)
             module = ""
@@ -150,17 +160,39 @@ class James:
                     module = stream.read(1610).decode("utf-8-sig", "ignore")
             chat = task_messages(title, self.ws.read(INDEX), self.ws.read(LESSONS), module, active, flows,
                                  self.global_memory.read("GLOBAL_LESSONS.md"),
-                                 self.global_memory.read("GLOBAL_TOOLS.md"))
+                                 self.global_memory.read("GLOBAL_TOOLS.md"),
+                                 missing=[p for p in scope if not self.ws.path(p).exists()])
             try:
+                active["budget"] = {"input_bound": sum(size(m["content"]) for m in chat) + FRAMING,
+                                    "pages": [p for p, page in active.get("pages", {}).items()
+                                              if page in chat[-1]["content"]], "module": module_path if module else None}
+                self.save(state)
                 action = self.model.reply(chat)
+                if action.get("op") == "write_file":
+                    action.update(op="create", text=action.get("text", action.get("content")))
                 self.approved_rows(state)
                 result = self.act(state, scope, flows, action)
                 rejected = 0
             except (ValueError, FileNotFoundError, IsADirectoryError) as exc:
-                # Invalid actions are tool feedback, never evidence of a failed repair.
                 state = self.ws.state()
                 active = state["active"]
+                self.report(f"Tool error · {exc}")
                 bounded_observation(active, f"Action rejected: {exc}")
+                if action.get("op") in {"create","read","patch"} and isinstance(action.get("path"), str):
+                    try:
+                        target = safe_name(action["path"], True)
+                    except ValueError:
+                        target = None
+                    if target:
+                        strikes = active.setdefault("tool_failures", {}).setdefault(target, [])
+                        strikes.append({"fix": action["op"] + " " + target, "reason": str(exc)})
+                        if len(strikes) >= 2:
+                            active["tool_issue"] = {"source":"tool", "symptom":str(exc),
+                                                    "diagnostic":str(exc), "attempts":strikes[-2:]}
+                            active["tool_path"] = target if target in scope else scope[0]
+                            state["phase"] = "halted"
+                            self.save(state)
+                            return self.packet(state, "")
                 self.save(state)
                 rejected += 1
                 if rejected == 3:
@@ -168,7 +200,7 @@ class James:
                 result = None
             if result:
                 return result
-        return event("paused", reason="Reached 32 actions on this task. Inspect status, supply a hint or run step again.")
+        return event("paused", reason="Reached the 8-action limit. Review the feed, add a hint or run another step.")
 
     def act(self, state, scope, flows, action):
         active = state["active"]
@@ -178,25 +210,84 @@ class James:
             path = safe_name(path, project_file=True)
         if op in {"read", "patch", "create", "symptom"} and path not in scope:
             raise ValueError("Choose a file from the current task's approved scope.")
+        patched = active.setdefault("patched_files", {})
+        verified = {target for target, stamp in patched.items() if active["reads"].get(target) == stamp}
+        if op in {"read", "patch", "create"} and path in verified and not active["issue"]:
+            if (op in {"read", "patch"} and verified.issuperset(scope)
+                    and not (active["had_bug"] or active.get("hint"))
+                    and (len(flows) <= 1 or active["verified"] == active["revision"])
+                    and all(self.ws.path(target).is_file()
+                            and digest(self.ws.path(target).read_bytes()) == patched[target] for target in scope)):
+                self.report("All targets patched and read back · Finishing step")
+                return self.finish(state, flows, {
+                    "done": f"Patched and read back {scope[0]}." if len(scope) == 1
+                            else f"Patched and read back all {len(scope)} target files.",
+                    "spark": "Capture the changed behavior in a focused regression check.",
+                })
+            raise ValueError(f"{path} was already patched and verified in this step. "
+                             "Finish when the remaining targets and checks are complete.")
+        names = {"read":"Reading", "create":"Writing", "patch":"Patching", "run":"Running",
+                 "symptom":"Checking behavior", "finish":"Verifying completion"}
+        if op != "read":
+            self.report(f"{names.get(op, op)} {path or action.get('name', '')}".strip())
+        if op in {"read","patch"} and not self.ws.path(path).exists():
+            if op == "patch" and action.get("old") == "" and isinstance(action.get("new"), str):
+                op = "create"
+                action = {**action, "op":op, "text":action["new"]}
+                self.report(f"Writing new file {path}")
+            else:
+                raise ValueError(f"{path} does not exist. Use create with path and text containing the new file.")
         changes, expected = {}, {}
         if op == "read":
             start, count = action.get("start", 1), action.get("lines", 45)
             if type(start) != int or start < 1 or type(count) != int or not 1 <= count <= 100:
                 raise ValueError("Use a positive start line and 1–100 lines per page.")
+            pages = active.setdefault("pages", {})
+            seen = active.setdefault("read_requests", {}).setdefault(path, {})
+            request = f"{start}:{count}"
+            stat = self.ws.path(path).stat()
+            stamp = [stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino]
+            previous = seen.get(request)
+            if previous is not None and previous["stamp"] == stamp:
+                if not active["changed"]:
+                    if (not active["issue"] and not (active["had_bug"] or active.get("hint"))
+                            and (len(flows) <= 1 or active["verified"] == active["revision"])
+                            and all(active["read_requests"].get(target)
+                                    and self.ws.path(target).is_file()
+                                    and active["reads"].get(target) == digest(self.ws.path(target).read_bytes())
+                                    for target in scope)):
+                        self.report("Existing targets inspected · Finishing step")
+                        return self.finish(state, flows, {
+                            "done": "The existing target files already satisfy the task.",
+                            "spark": "Keep a focused regression check for the existing behavior.",
+                        })
+                    result = "Already read in this step. Finish after inspecting remaining targets and resolving outstanding checks."
+                    self.report(result)
+                    bounded_observation(active, result)
+                    self.save(state)
+                    return None
+                raise ValueError("Already read in this step — content is already in your context. "
+                                 "Now either patch the file or call finish.")
+            self.report(f"Reading {path}")
             source, fingerprint = actions.read_source(self.ws, path)
             page = f"{path} from line {start}\n" + actions.lines_at(source, start, count)
-            pages = active.setdefault("pages", {})
-            repeated = pages.pop(path, None) == clip(page, 7000)
+            seen[request] = {"stamp": stamp}
+            pages.pop(path, None)
             pages[path] = clip(page, 7000)
             active["reads"][path] = fingerprint
-            if (repeated and active["changed"] and len(flows) == 1 and
-                    active.get("checked_revision") != active["revision"]):
-                return self.act(state, scope, flows, {"op": "run", "name": next(iter(flows))})
             result = f"Read {path} from line {start}."
         elif op in {"patch", "create"}:
             changes, expected = actions.edit(self.ws, active, action, path)
-            active.get("pages", {}).pop(path, None)
-            result = active["fixes"][-1]
+            active.get("tool_failures", {}).pop(path, None)
+            if changes:
+                active.get("pages", {}).pop(path, None)
+                active.get("read_requests", {}).pop(path, None)
+                if op == "patch":
+                    patched[path] = digest(changes[path].encode("utf-8"))
+                else:
+                    patched.pop(path, None)
+            result = (active["fixes"][-1] if changes else
+                      f"{path} already matches the supplied text. Return finish now if the task goal is met.")
         elif op == "run":
             name = actions.field(action, "name", 50)
             if name not in flows:
@@ -232,6 +323,7 @@ class James:
         return None
 
     def failure(self, state, source, diagnostic, symptom):
+        self.report(f"Tool error · {source}: {symptom}")
         a = state["active"]
         issue = a["issue"]
         same_issue = bool(issue and (issue["source"], issue["symptom"]) == (source, symptom))
@@ -256,15 +348,18 @@ class James:
         if state["phase"] != "halted":
             raise ValueError("A consultation packet requires two consecutive failed attempts.")
         a = state["active"]
-        issue = a["issue"]
-        location = a.get("location") if issue["source"] == "behavior" else None
+        issue = a.get("tool_issue") or a["issue"]
+        location = [a["tool_path"], 1] if a.get("tool_issue") else a.get("location") if issue["source"] == "behavior" else None
         path, line = location or a.get("last_edit", [parse_title(a["title"])[0], 1])
         # Prefer the deepest in-scope traceback frame over the last edited location.
         for frame, number in re.findall(r'File "([^"]+)", line (\d+)', issue["diagnostic"]):
             for target in parse_title(a["title"]):
                 if frame.replace("\\", "/").endswith("/" + target) or frame == target:
                     path, line = target, int(number)
-        source = self.ws.read(path, "")
+        try:
+            source = self.ws.read(path, "")
+        except (ValueError, OSError):
+            source = ""
         start = max(1, min(line - 15, len(source.splitlines()) - 39))
         snippet = actions.lines_at(source, start, 40, numbered=True)
         attempts = "\n".join(f"{i}. {t['fix']} — {t['reason']}" for i, t in enumerate(issue["attempts"], 1))
@@ -284,7 +379,9 @@ class James:
         a["hint"] = hint
         a["guided_fix"] = True
         a.pop("inflight", None)
-        if state["phase"] == "halted":
+        if a.pop("tool_issue", None):
+            a.get("tool_failures", {}).pop(a.pop("tool_path"), None)
+        elif state["phase"] == "halted":
             a["issue"]["attempts"] = []
         state["phase"] = "ready"
         self.save(state)
@@ -292,7 +389,7 @@ class James:
 
     def confirm(self, state, _):
         a = state.get("active")
-        if not a or not a["issue"] or a["issue"]["source"] != "behavior":
+        if not a or a.get("tool_issue") or not a["issue"] or a["issue"]["source"] != "behavior":
             raise ValueError("Confirm is for a manually verified behavioral fix.")
         a.update(issue=None, verified=a["revision"])
         state["phase"] = "ready"

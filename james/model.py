@@ -17,17 +17,22 @@ class LocalModel:
             raise ValueError("JAMES_ENDPOINT must be an HTTP(S) API base.")
         self.name = os.getenv("JAMES_MODEL", "qwen3-coder:30b")
 
-    def reply(self, chat, structured=True):
+    def reply(self, chat, structured=True, image=None):
         system, user = chat
         chat = messages(system["content"], user["content"])
         payload = {"model": self.name, "messages": chat, "stream": False}
         headers = {"Content-Type": "application/json"}
         if self.provider == "ollama":
+            if image:
+                chat[-1]["images"] = [image]
             url = self.base + "/api/chat"
             payload["options"] = {"num_ctx": WINDOW, "num_predict": OUTPUT, "temperature": 0.15}
             if structured:
                 payload["format"] = structured if isinstance(structured, dict) else "json"
         else:
+            if image:
+                chat[-1]["content"] = [{"type": "text", "text": user["content"]},
+                                       {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image}}]
             url = self.base + "/chat/completions"
             payload.update(max_tokens=OUTPUT, temperature=0.15)
             if structured and os.getenv("JAMES_JSON_MODE", "1") != "0":

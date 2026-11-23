@@ -56,6 +56,9 @@ def main(argv=None):
     parser.add_argument("--workspace", "-C", default=".", help="project directory (default: current directory)")
     parser.add_argument("--json", action="store_true", help="emit a machine-readable event")
     sub = parser.add_subparsers(dest="command", required=True)
+    ui = sub.add_parser("ui", help="open the local web workbench")
+    ui.add_argument("--port", type=int, default=8765)
+    ui.add_argument("--no-browser", action="store_true")
     for name, help_text in {
         "init": "initialize project memory", "status": "show the plan and session state",
         "approve": "approve the current TODO.md", "step": "execute one approved task",
@@ -71,6 +74,13 @@ def main(argv=None):
     if argument == "-":
         argument = sys.stdin.read()
     try:
+        if args.command == "ui":
+            try:
+                from .workbench import serve
+            except ModuleNotFoundError as exc:
+                raise RuntimeError('Install the web extra with python -m pip install -e ".[ui]"') from exc
+            serve(args.workspace, args.port, not args.no_browser)
+            return 0
         result = James(args.workspace, LocalModel()).command(args.command, argument)
     except (ValueError, OSError, RuntimeError) as exc:
         if args.json:

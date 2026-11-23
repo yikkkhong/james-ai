@@ -1,4 +1,14 @@
-# James 1.0
+# James 2.1
+
+## Local Web Workbench
+
+Run `.\james.ps1 -C $project ui` to serve the selected project on loopback and open it in your browser. This checkout uses its local virtual environment. On a fresh installation install the optional web dependencies once with `python -m pip install -e ".[ui]"` in your chosen environment. Use `ui --port 8766` for another project or `ui --no-browser` for headless use. Stop the server with Ctrl+C.
+
+Create milestone folders and follow-up conversations in the left sidebar. Rename or move the selected item with **Rename / move**. Each project stores its tree and conversation records under `.james/threads/`. Running a build step records the associated checklist row and resulting event in the selected milestone. Follow-up conversations use the most recent three Q&A exchanges as bounded context.
+
+Select lines in the read-only code viewer and choose **Ask James**. The server reads the selected lines and neighboring context from the current file. The answer is saved in the conversation. **Promote to task** lets you review the outcome and target files before adding a row to the plan. Approve the edited checklist before running a step.
+
+Use **Prototype from Sketch** for a text layout or a pasted/uploaded wireframe. The browser scales images to 512 pixels and sends them to the configured local model for a layout description. Image input requires a vision-capable model. Text sketches work with coding models. Both paths use the planner and shared design preferences and stop at review. The dashboard polls during a build and reports the last prompt's conservative input bound, loaded file pages and output reservation.
 
 James runs one approved coding task at a time against a local chat model. The durable handoff between tasks is a Markdown artifact index. You can inspect and edit the plan in any text editor.
 
@@ -74,7 +84,7 @@ Register reusable scripts in `GLOBAL_TOOLS.md` as bullet entries with a path rel
 
 This reserves approximately 90% for current-task input and generation together. For Qwen's byte-level tokenizer, James conservatively charges one token per UTF-8 byte of message content. This leaves headroom and avoids a tokenizer dependency. Each request has two messages. Oversized user questions fail before transmission. James keeps the latest requested page per file and evicts older pages from the prompt as the budget fills. For custom templates or tokenizers, the serving engine's 16,384 setting provides the hard model-side ceiling.
 
-Each plan row has the form `- [ ] Implement a named outcome | src/file.py, tests/test_file.py, memory/module.md`. Planning sees a bounded path inventory. Execution receives one row, up to one relevant memory module and requested code excerpts from that row's scope. Existing files require a fresh read and a unique, exact patch anchor. Create accepts new paths only. Text targets are UTF-8 and at most 2 MB for reading. James identifies changed Python symbols from the AST and uses model-supplied symbol annotations for other languages.
+Generated plans assign one file to each row, as in `- [ ] Implement a named outcome | src/file.py`. Execution receives one row and reads code within its scope. Existing files require a fresh read and a unique, exact patch anchor. James can rewrite a file it created during the current task if its contents still match James's last write. Text targets are UTF-8 and at most 2 MB for reading. James identifies changed Python symbols from the AST and uses model-supplied symbol annotations for other languages.
 
 Completion commits the checkbox, index update and any local lesson, and removes the active record. Shared lessons are persisted first with duplicate checks. Intermediate diagnostics, observations and hints are evicted. The next request rebuilds its context from disk. Q&A is an independent, single-turn call with read-only memory access. Include any desired code snippet in the question.
 
@@ -133,7 +143,7 @@ Per managed project
 
 `James(root, model).command(name, argument)` returns a JSON-serializable event. Use `--json` for the equivalent terminal envelope. For example, a completed event contains `event`, `done`, `changed` (path → symbols), `spark` and `notices`. Consumers can use `status` for `phase`, `todo`, `current` and pending notices. Build state transitions from `review` to `ready`, optionally `halted`, then `complete`. Q&A has its own entry point. A future UI can add thread IDs, image input or code selections around this interface.
 
-CLI exit codes are 0 for a result, 1 for a rejected command or connection error, and 2 for a paused or halted task. A workspace lock serializes build writers. A pending file transaction rolls forward on the next mutating command. If a user edit conflicts with recovery, James preserves it and identifies the journal. If interrupted during an external command, inspect its effects and use `hint` to resume. The model has a 32-action limit per invocation and pauses after three consecutive invalid actions. These pauses preserve the task and are separate from a two-fix consultation.
+CLI exit codes are 0 for a result, 1 for a rejected command or connection error, and 2 for a paused or halted task. A workspace lock serializes build writers. A pending file transaction rolls forward on the next mutating command. If a user edit conflicts with recovery, James preserves it and identifies the journal. If interrupted during an external command, inspect its effects and use `hint` to resume. Each step allows eight model actions. Two failed file operations on the same target before a successful write halt the task and create a consultation packet. The workbench streams tool activity, elapsed time and the next action. Stop terminates the step worker and its commands. Completed writes are kept. New build plan archives the previous checklist and build events once the replacement plan passes validation.
 
 ```sh
 python -m unittest discover -s tests -v

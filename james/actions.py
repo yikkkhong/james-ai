@@ -89,13 +89,21 @@ def exported_symbols(source):
 
 def edit(ws, active, action, path):
     if action["op"] == "create":
-        if ws.path(path).exists():
-            raise ValueError("Create requires a new path. Read and patch the existing file.")
         text = action.get("text")
         if not isinstance(text, str) or len(text) > 64000:
             raise ValueError("Supply UTF-8 text for the new file.")
         before, pos, old, new = None, 1, "", text
         original = ""
+        if ws.path(path).exists():
+            created = active.get("created", {})
+            if path not in created:
+                raise ValueError("This file existed before the task. Read and patch it. If it already meets the goal, return finish.")
+            original, before = read_source(ws, path)
+            if before != created[path]:
+                raise ValueError("This file changed outside James. Read and patch the current version.")
+            if original == text:
+                return {}, {}
+            old = original
     else:
         original, before = read_source(ws, path)
         if active["reads"].get(path) != before:
@@ -109,8 +117,8 @@ def edit(ws, active, action, path):
             new = new.replace("\r\n", "\n").replace("\n", "\r\n")
         if original.count(old) != 1:
             raise ValueError("Patch anchor must match exactly once.")
-        if original and old.strip() == original.lstrip("\ufeff").strip():
-            raise ValueError("Whole-file replacement rejected. Use a smaller anchor.")
+        if old.strip() == original.lstrip("\ufeff").strip() and len(original.splitlines()) > 80:
+            raise ValueError("Whole-file replacement rejected for a file over 80 lines. Use a smaller anchor.")
         pos = original[:original.index(old)].count("\n") + 1
         text = original.replace(old, new, 1)
     symbols = action.get("symbols", [])
@@ -123,8 +131,12 @@ def edit(ws, active, action, path):
             symbols = actual
     touched = active["changed"].setdefault(path, [])
     touched.extend(s for s in symbols if s not in touched)
+    created = active.setdefault("created", {})
+    if before is None or path in created:
+        created[path] = digest(text.encode("utf-8"))
     active["revision"] += 1
     active["last_edit"] = [path, pos]
+    active["last_edit_op"] = action["op"]
     active["reads"].pop(path, None)
     location = f"{action['op']} {path}:{pos} ({', '.join(dict.fromkeys(symbols)) or 'file scope'})"
     old_preview = " ".join(old.split())[:180]

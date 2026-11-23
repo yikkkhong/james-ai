@@ -12,7 +12,7 @@ from james.engine import James, fresh_task
 from james.model import LocalModel
 from james.workspace import CONFIG, INDEX, LESSONS, STATE, TODO, Workspace, digest, packed, safe_name
 
-TITLES = ["Implement a counter | counter.py, memory/counter.md",
+TITLES = ["Implement a counter | counter.py",
           "Add a formatter | formatter.py", "Add examples | examples.py",
           "Add a runner | run.py", "Write usage notes | README.md"]
 FINISH = {"op": "finish", "done": "Added the counter.", "spark": "Exercise the zero case."}
@@ -116,10 +116,11 @@ class Sessions(unittest.TestCase):
         self.assertEqual(self.james.ws.state()["phase"], "idle")
 
     def test_plan_recovers_on_single_retry(self):
-        self.model.actions.extend([{"tasks": []}, {"tasks": TITLES}])
+        bundled = [TITLES[0] + ", calculator.html", *TITLES[1:]]
+        self.model.actions.extend([{"tasks": bundled}, {"tasks": TITLES}])
         self.assertEqual(self.james.command("plan", "Build greetings")["event"], "review_required")
         self.assertEqual(len(self.model.chats), 2)
-        self.assertIn("Previous draft rejected", self.model.chats[-1][1]["content"])
+        self.assertIn("exactly one target file", self.model.chats[-1][1]["content"])
 
     def test_gate_edited_plan_scope_and_fresh_context(self):
         self.model.actions.append({"tasks": TITLES})
@@ -128,7 +129,8 @@ class Sessions(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "approved"):
             self.james.command("step")
         todo = self.root / TODO
-        todo.write_text(todo.read_text().replace("Add a runner", "Create the runner"))
+        todo.write_text(todo.read_text().replace("Add a runner", "Create the runner")
+                        .replace(TITLES[0], TITLES[0] + ", memory/counter.md"))
         self.james.command("approve")
         todo.write_text(todo.read_text().replace("Add examples", "Provide examples"))
         with self.assertRaisesRegex(ValueError, "changed"):
@@ -187,21 +189,113 @@ class Sessions(unittest.TestCase):
 
     def test_whole_file_patch_and_stale_read(self):
         self.approved()
-        (self.root / "counter.py").write_text("a=1\nb=2\n")
-        self.model.actions.extend([READ, change("a=1\nb=2", "replaced"), change("missing", "oops"),
+        source = "# filler\n" * 79 + "a=1\nb=2\n"
+        (self.root / "counter.py").write_text(source)
+        self.model.actions.extend([READ, change(source, "replaced"),
                                    change("a=1", "a=2"), change("b=2", "b=3"), READ, FINISH])
         self.james.command("step")
-        self.assertEqual((self.root / "counter.py").read_text(), "a=2\nb=2\n")
+        self.assertEqual((self.root / "counter.py").read_text(), source.replace("a=1", "a=2"))
         self.assertIn("Whole-file replacement rejected", str(self.model.chats))
         self.assertIn("Read the current file", str(self.model.chats))
 
-    def test_repeated_page_triggers_single_configured_check(self):
+    def test_full_patch_at_80_lines_reminds_model_to_finish_after_read(self):
         self.approved()
+        source = "# filler\n" * 79 + "counter = 0\n"
+        file = self.root / "counter.py"
+        file.write_text(source)
+        self.model.actions.extend([READ, change(source, "counter = 1\n"), READ, FINISH])
+        self.assertEqual(self.james.command("step")["event"], "completed")
+        self.assertEqual(file.read_text(), "counter = 1\n")
+        reminder = "Your patch succeeded and has been verified. Call `finish` now unless a concrete bug remains."
+        self.assertNotIn(reminder, self.model.chats[-2][0]["content"])
+        self.assertIn(reminder, self.model.chats[-1][0]["content"])
+
+    def test_verified_patch_auto_finishes_on_another_read_or_patch(self):
+        for retry in ({**READ, "start": 2}, change("counter = 1", "counter = 2")):
+            with self.subTest(op=retry["op"]):
+                self.approved()
+                file = self.root / "counter.py"
+                file.write_text("counter = 0\n")
+                self.model.actions.extend([READ, change("counter = 0", "counter = 1"), READ, retry])
+                result = self.james.command("step")
+                self.assertEqual(result["event"], "completed")
+                self.assertEqual(file.read_text(), "counter = 1\n")
+                self.assertIn("Patched and read back", result["done"])
+                self.assertTrue((self.root / TODO).read_text().splitlines()[2].startswith("- [x]"))
+                # Reset only the disposable test workspace before testing the other retry.
+                (self.root / STATE).unlink()
+
+    def test_verified_target_is_locked_until_remaining_target_is_verified(self):
+        self.approved()
+        todo = self.root / TODO
+        todo.write_text(todo.read_text().replace(TITLES[0], TITLES[0] + ", helper.py"))
+        self.james.command("approve")
+        (self.root / "counter.py").write_text("counter = 0\n")
+        (self.root / "helper.py").write_text("helper = 0\n")
+        helper = {**READ, "path": "helper.py"}
+        helper_patch = {**change("helper = 0", "helper = 1"), "path": "helper.py"}
+        self.model.actions.extend([READ, change("counter = 0", "counter = 1"), READ,
+                                   change("counter = 1", "counter = 2"), helper, helper_patch, helper, READ])
+        self.assertEqual(self.james.command("step")["event"], "completed")
+        self.assertIn("already patched and verified", self.model.chats[-4][1]["content"])
+        self.assertEqual((self.root / "counter.py").read_text(), "counter = 1\n")
+
+    def test_missing_target_breaks_and_recovers(self):
+        self.approved()
+        self.model.actions.extend([READ, change("absent", "body")])
+        result = self.james.command("step")
+        self.assertEqual(result["event"], "consultation")
+        self.assertIn("Use create", result["packet"])
+        self.assertIn("2. patch counter.py", result["packet"])
+        self.assertFalse((self.root / "counter.py").exists())
+        self.james.command("hint", "Create the missing target.")
+        self.model.actions.extend([change("", "counter = 1\n"), READ,
+                                   {**FINISH, "lesson":"Create missing targets directly."}])
+        self.assertEqual(self.james.command("step")["event"], "completed")
+        self.assertEqual((self.root / "counter.py").read_text(), "counter = 1\n")
+
+    def test_finish_runs_configured_check_after_duplicate_read(self):
+        self.approved()
+        activity = []
+        self.james.report = activity.append
         (self.root / CONFIG).write_text(packed({"verify": [["{python}", "-c", "print('verified')"]]}))
         self.model.actions.extend([{"op": "create", "path": "counter.py", "text": "counter = 1\n"},
                                    READ, READ, FINISH])
         self.assertEqual(self.james.command("step")["event"], "completed")
-        self.assertIn("verify passed", str(self.model.chats[-1]))
+        self.assertIn("Running verify", activity)
+
+    def test_duplicate_read_finishes_task_with_existing_target(self):
+        self.approved()
+        (self.root / "counter.py").write_text("counter = 1\n")
+        activity = []
+        self.james.report = activity.append
+        self.model.actions.extend([READ, READ, FINISH])
+        result = self.james.command("step")
+        self.assertEqual(result["event"], "completed")
+        self.assertEqual(result["changed"], {})
+        self.assertEqual(self.james.ws.state()["completed"], [TITLES[0]])
+        self.assertEqual(activity.count("Reading counter.py"), 1)
+        self.assertEqual((self.root / "counter.py").read_text(), "counter = 1\n")
+        self.assertEqual(self.model.actions, [FINISH])
+
+    def test_create_revises_its_own_file_and_skips_duplicate_io(self):
+        self.approved()
+        create = {"op": "create", "path": "counter.py", "text": "counter = 0\n"}
+        revise = {**create, "op": "write_file", "text": "counter = 1\n"}
+        self.model.actions.extend([create, revise, READ, revise, READ, FINISH])
+        self.assertEqual(self.james.command("step")["event"], "completed")
+        self.assertEqual((self.root / "counter.py").read_text(), "counter = 1\n")
+        self.assertIn("already matches the supplied text", str(self.model.chats[-2]))
+        self.assertIn("Already read in this step", str(self.model.chats[-1]))
+
+    def test_write_file_cannot_replace_preexisting_file(self):
+        self.approved()
+        file = self.root / "counter.py"
+        file.write_text("counter = 0\n")
+        write = {"op": "write_file", "path": "counter.py", "text": "counter = 1\n"}
+        self.model.actions.extend([write, write])
+        self.assertEqual(self.james.command("step")["event"], "consultation")
+        self.assertEqual(file.read_text(), "counter = 0\n")
 
     def test_distillation_preserves_original(self):
         self.james.command("init")
@@ -221,6 +315,8 @@ class Sessions(unittest.TestCase):
         self.model.actions.extend([a, READ, change("return 0", "return 1"), a,
                                    READ, change("return 1", "return 2"), b, b,
                                    READ, change("return 2", "return 3"), b, FINISH])
+        self.assertIn("8-action limit", self.james.command("step")["reason"])
+        self.assertEqual(len(self.model.actions), 4)
         self.assertEqual(self.james.command("step")["event"], "paused")
         issue = self.james.ws.state()["active"]["issue"]
         self.assertEqual(len(issue["attempts"]), 1)
@@ -292,10 +388,14 @@ class Providers(unittest.TestCase):
                     endpoint = base if provider == "ollama" else base + "/v1"
                     with patch.dict(os.environ, {"JAMES_PROVIDER": provider, "JAMES_ENDPOINT": endpoint}):
                         self.assertEqual(LocalModel().reply(messages("system", "input")), {"tasks": []})
+                        LocalModel().reply(messages("system", "inspect sketch"), structured=False, image="aW1n")
             finally:
                 server.shutdown()
                 thread.join()
         self.assertEqual(requests[0][1]["options"]["num_ctx"], 16384)
         self.assertEqual(requests[0][1]["options"]["num_predict"], OUTPUT)
-        self.assertEqual(requests[1][0], "/v1/chat/completions")
-        self.assertEqual(requests[1][1]["max_tokens"], OUTPUT)
+        self.assertEqual(requests[1][1]["messages"][-1]["images"], ["aW1n"])
+        self.assertEqual(requests[2][0], "/v1/chat/completions")
+        self.assertEqual(requests[2][1]["max_tokens"], OUTPUT)
+        self.assertEqual(requests[3][1]["messages"][-1]["content"][1]["image_url"]["url"],
+                         "data:image/png;base64,aW1n")

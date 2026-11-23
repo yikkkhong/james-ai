@@ -44,13 +44,16 @@ def memory_context(index, lessons, global_lessons, global_tools, budget):
     return "".join("\n" + label + "\n" + clip(content, allowance) for label, content in sections.items())
 
 
-def task_messages(title, index, lessons, module, active, flows, global_lessons="", global_tools=""):
+def task_messages(title, index, lessons, module, active, flows, global_lessons="", global_tools="", missing=()):
     rules = prompt("build")
+    if active.get("last_edit_op") == "patch" and active["last_edit"][0] in active["reads"]:
+        rules += "\nYour patch succeeded and has been verified. Call `finish` now unless a concrete bug remains."
     # Prioritize index rows referencing the active scope and the newest lessons.
     paths = title.split(" | ")[1].split(", ")
     rows = sorted(index.splitlines(), key=lambda row: not any(p in row for p in paths))
     rules += memory_context("\n".join(rows), lessons, global_lessons, global_tools, SHARED - size(rules))
     facts = {"current_task": title, "workflows": list(flows), "already_changed": list(active["changed"]),
+             "missing_files_use_create_with_path_and_text": list(missing),
              "lesson_required": bool(active.get("had_bug") or active.get("hint"))}
     header = json.dumps(facts, ensure_ascii=False)
     if size(header) > FOCUS // 2:
